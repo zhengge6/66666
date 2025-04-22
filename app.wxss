@@ -1,0 +1,14 @@
+page {
+    --radius: 25rpx;
+    --background: #f3f3f3;
+    --margin: 30rpx;
+    --color: #0052d9;
+    background: var(--background);
+    font-family: DingTalk-JinBuTi,DeYiHei,SourceHan,Arial,sans-serif;
+}
+
+.background {
+    height: 100vh;
+    position: fixed;
+    width: 100vw;
+}

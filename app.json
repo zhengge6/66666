@@ -1,0 +1,78 @@
+{
+    "pages": [
+        "pages/home/home",
+        "pages/advertise/advertise",
+        "pages/share/share",
+        "pages/setting/setting"
+    ],
+    "resolveAlias": {
+        "~/*": "/*",
+        "@utils/*": "utils/*"
+    },
+    "window": {
+        "navigationBarTextStyle": "black",
+        "navigationBarBackgroundColor": "#ffffff",
+        "navigationStyle": "custom"
+    },
+    "sitemapLocation": "sitemap.json",
+    "requiredPrivateInfos": [
+        "chooseLocation",
+        "getLocation"
+    ],
+    "permission": {
+        "scope.userLocation": {
+            "desc": "进行位置考勤"
+        }
+    },
+    "usingComponents": {
+        "watermark": "/components/watermark/watermark",
+        "no-data": "/components/no-data/no-data",
+        "ad": "/components/ad/ad"
+    },
+    "subPackages": [
+        {
+            "root": "packages/sign-package/",
+            "pages": [
+                "pages/im/im",
+                "pages/vip/vip",
+                "pages/scan/scan",
+                "pages/home/home",
+                "pages/login/login",
+                "pages/group/group",
+                "pages/course/course",
+                "pages/signin/signin",
+                "pages/setting/setting",
+                "pages/activity/activity"
+            ]
+        },
+        {
+            "root": "packages/tools-package/",
+            "pages": [
+                "pages/calc/calc",
+                "pages/sport/sport",
+                "pages/hui798/hui798",
+                "pages/waadri/waadri",
+                "pages/question/question",
+                "pages/location/location"
+            ]
+        },
+        {
+            "root": "packages/static-package/",
+            "pages": [
+                "pages/web/web",
+                "pages/error/error"
+            ],
+            "independent": true
+        }
+    ],
+    "preloadRule": {
+        "pages/home/home": {
+            "network": "all",
+            "packages": [
+                "packages/sign-package",
+                "packages/tools-package",
+                "packages/static-package"
+            ]
+        }
+    }
+}
