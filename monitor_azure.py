@@ -25,12 +25,32 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import List, Dict, Set, Optional
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from enum import Enum
 import sys
 
+
+# ===================== 时区配置 =====================
+BJ_TZ = ZoneInfo("Asia/Shanghai")
+
+def now_bj() -> datetime:
+    """获取当前北京时间"""
+    return datetime.now(BJ_TZ)
+
+def today_bj() -> str:
+    """获取当前北京日期 (YYYY-MM-DD)"""
+    return now_bj().strftime("%Y-%m-%d")
+
+def time_bj() -> str:
+    """获取当前北京时间 (HH:MM:SS)"""
+    return now_bj().strftime("%H:%M:%S")
+
+def iso_bj() -> str:
+    """获取当前北京时间的ISO格式"""
+    return now_bj().isoformat()
 
 # ===================== 配置区域 =====================
 # 从环境变量读取配置（Azure服务器上通过export设置）
@@ -147,6 +167,16 @@ class DownloadTask:
     item: NewsItem
 
 
+class BeijingFormatter(logging.Formatter):
+    """自定义日志格式化器 - 使用北京时间"""
+    def formatTime(self, record, datefmt=None):
+        """重写时间格式化方法，使用北京时间"""
+        dt = datetime.fromtimestamp(record.created, BJ_TZ)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime('%Y-%m-%d %H:%M:%S')
+
+
 class LoggerManager:
     """日志管理器 - 支持日志轮转"""
     _instance = None
@@ -183,7 +213,7 @@ class LoggerManager:
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(logging.INFO)
         
-        formatter = logging.Formatter(
+        formatter = BeijingFormatter(
             '%(asctime)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
@@ -215,7 +245,7 @@ class DataStore:
         self.all_news: Dict[str, NewsItem] = {}
         self.check_count = 0
         self.last_check_time: Optional[str] = None
-        self.start_time = datetime.now().isoformat()
+        self.start_time = iso_bj()
         self._lock = threading.Lock()
         
         # 确保数据目录存在
@@ -249,7 +279,7 @@ class DataStore:
                     'check_count': self.check_count,
                     'last_check_time': self.last_check_time,
                     'start_time': self.start_time,
-                    'save_time': datetime.now().isoformat()
+                    'save_time': iso_bj()
                 }
                 with open(self.data_file, 'w', encoding='utf-8') as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
@@ -258,13 +288,13 @@ class DataStore:
     
     def update_news(self, new_items: List[NewsItem]) -> List[NewsItem]:
         with self._lock:
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = today_bj()
             truly_new = []
             
             for item in new_items:
                 key = self._make_key(item)
                 if key not in self.all_news:
-                    item.first_seen = datetime.now().isoformat()
+                    item.first_seen = iso_bj()
                     item.notified = False
                     self.all_news[key] = item
                     
@@ -275,7 +305,7 @@ class DataStore:
                     existing.url = item.url
             
             self.check_count += 1
-            self.last_check_time = datetime.now().isoformat()
+            self.last_check_time = iso_bj()
         
         self.save()
         return truly_new
@@ -296,7 +326,7 @@ class DataStore:
         self.save()
     
     def get_today_stats(self) -> dict:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = today_bj()
         today_news = [v for v in self.all_news.values() if v.date == today]
         notified = sum(1 for v in today_news if v.notified)
         
@@ -694,8 +724,8 @@ class EmailSender:
     
     def send_test_email(self) -> bool:
         """发送测试邮件"""
-        today = datetime.now().strftime("%Y-%m-%d")
-        now = datetime.now().strftime("%H:%M:%S")
+        today = today_bj()
+        now = time_bj()
         
         html = f"""
         <!DOCTYPE html>
@@ -739,7 +769,7 @@ class EmailSender:
     
     def send_news_notification(self, news_items: List[NewsItem], has_new: bool = True) -> bool:
         """发送新公告通知 - 优化标题"""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = today_bj()
         
         if not has_new:
             # 无新通知时的简洁邮件
@@ -857,7 +887,7 @@ class EmailSender:
         if not item.is_special:
             return False
         
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = today_bj()
         full_url = f"https://jyj.suqian.gov.cn{item.url}" if not item.url.startswith('http') else item.url
         
         attachments_html = ""
@@ -943,12 +973,12 @@ class EmailSender:
     
     def send_report(self, stats: dict) -> bool:
         """发送述职报告"""
-        today = datetime.now().strftime("%Y-%m-%d")
-        now = datetime.now().strftime("%H:%M:%S")
+        today = today_bj()
+        now = time_bj()
         
         try:
             start = datetime.fromisoformat(stats['start_time'])
-            runtime = datetime.now() - start
+            runtime = now_bj() - start.replace(tzinfo=BJ_TZ)
             runtime_str = f"{runtime.days}天 {runtime.seconds//3600}小时 {(runtime.seconds//60)%60}分钟"
         except:
             runtime_str = "未知"
@@ -1138,7 +1168,7 @@ class MonitorThread(threading.Thread):
     
     def _is_in_runtime(self) -> bool:
         """检查是否在运行时间内"""
-        now = datetime.now()
+        now = now_bj()
         return RUN_START_HOUR <= now.hour < RUN_END_HOUR
     
     def run(self):
@@ -1153,10 +1183,10 @@ class MonitorThread(threading.Thread):
             
             # 检查是否在运行时间内
             if not self._is_in_runtime():
-                next_start = datetime.now().replace(hour=RUN_START_HOUR, minute=0, second=0)
-                if next_start < datetime.now():
+                next_start = now_bj().replace(hour=RUN_START_HOUR, minute=0, second=0)
+                if next_start < now_bj():
                     next_start += timedelta(days=1)
-                wait_seconds = (next_start - datetime.now()).total_seconds()
+                wait_seconds = (next_start - now_bj()).total_seconds()
                 self.logger.info(f"⏰ 非运行时间，等待至 {RUN_START_HOUR}:00 (约{wait_seconds/3600:.1f}小时)")
                 time.sleep(min(wait_seconds, 3600))  # 最多等待1小时再检查
                 continue
