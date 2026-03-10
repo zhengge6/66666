@@ -45,7 +45,7 @@ MONITOR_URL = os.getenv("MONITOR_URL", "https://jyj.suqian.gov.cn/sjyj/tzgg/list
 
 # 时间配置（秒）
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))  # 10分钟
-REPORT_INTERVAL = int(os.getenv("REPORT_INTERVAL", "3600"))  # 1小时
+REPORT_INTERVAL = int(os.getenv("REPORT_INTERVAL", "10800"))  # 3小时
 
 # 运行时间配置
 RUN_START_HOUR = int(os.getenv("RUN_START_HOUR", "6"))   # 早6点
@@ -57,11 +57,18 @@ LOG_FILE = Path(os.getenv("LOG_FILE", "/home/azureuser/monitor/monitor.log"))
 ATTACHMENTS_DIR = Path(os.getenv("ATTACHMENTS_DIR", "/home/azureuser/monitor/attachments"))
 
 # 日志配置
-LOG_MAX_BYTES = 10 * 1024 * 1024
-LOG_BACKUP_COUNT = 5
+LOG_MAX_BYTES = 5 * 1024 * 1024       # 5MB 单文件大小
+LOG_BACKUP_COUNT = 3                  # 保留3个备份
+LOG_AI_SUMMARY_INTERVAL = 3600        # 每小时AI整理一次日志
 
 # 特殊关键词配置
 SPECIAL_KEYWORDS = ["宿迁市市直教育系统", "体检", "拟招聘"]
+
+# 硅基流动 AI 配置
+SILICONFLOW_API_KEY = os.getenv("SILICONFLOW_API_KEY", "sk-ugbzeiqbbibjfhhtpdsqfajevuwlcagljpkydhorkokkuzaq")
+SILICONFLOW_API_URL = "https://api.siliconflow.cn/v1/chat/completions"
+SILICONFLOW_MODEL = "deepseek-ai/DeepSeek-V3.2"
+AI_SUMMARY_ENABLED = os.getenv("AI_SUMMARY_ENABLED", "true").lower() == "true"
 # ===================================================
 
 
@@ -83,6 +90,7 @@ class NewsItem:
     is_special: bool = False
     attachments: List[dict] = None
     attachments_downloaded: bool = False
+    ai_summary: str = ""  # AI生成的摘要
     
     def __post_init__(self):
         if self.attachments is None:
@@ -97,7 +105,8 @@ class NewsItem:
             'notified': self.notified,
             'is_special': self.is_special,
             'attachments': self.attachments,
-            'attachments_downloaded': self.attachments_downloaded
+            'attachments_downloaded': self.attachments_downloaded,
+            'ai_summary': self.ai_summary
         }
     
     @classmethod
@@ -110,7 +119,8 @@ class NewsItem:
             notified=data.get('notified', False),
             is_special=data.get('is_special', False),
             attachments=data.get('attachments', []),
-            attachments_downloaded=data.get('attachments_downloaded', False)
+            attachments_downloaded=data.get('attachments_downloaded', False),
+            ai_summary=data.get('ai_summary', '')
         )
     
     def __hash__(self):
@@ -307,6 +317,193 @@ class DataStore:
         }
 
 
+class AISummarizer:
+    """AI 摘要生成器 - 使用硅基流动 DeepSeek"""
+    def __init__(self, logger: LoggerManager):
+        self.logger = logger
+        self.api_key = SILICONFLOW_API_KEY
+        self.api_url = SILICONFLOW_API_URL
+        self.model = SILICONFLOW_MODEL
+        self.enabled = AI_SUMMARY_ENABLED
+        self.ssl_context = ssl.create_default_context()
+        self.ssl_context.check_hostname = False
+        self.ssl_context.verify_mode = ssl.CERT_NONE
+    
+    def summarize(self, title: str, content: str = "") -> str:
+        """生成公告摘要"""
+        if not self.enabled:
+            return ""
+        
+        try:
+            prompt = f"""请对以下教育类公告标题进行简要分析，提取关键信息（如招聘单位、岗位数量、截止时间等），用一句话总结核心内容，不超过50字：
+
+公告标题：{title}
+
+请直接输出总结，不要添加任何前缀或解释。"""
+            
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "你是一位专业的教育招聘信息分析助手，擅长从公告标题中提取关键信息。"},
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 200,
+                "temperature": 0.3,
+                "top_p": 0.7
+            }
+            
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            req = urllib.request.Request(
+                self.api_url,
+                data=json.dumps(payload).encode('utf-8'),
+                headers=headers,
+                method='POST'
+            )
+            
+            with urllib.request.urlopen(req, context=self.ssl_context, timeout=30) as response:
+                result = json.loads(response.read().decode('utf-8'))
+            
+            summary = result['choices'][0]['message']['content'].strip()
+            self.logger.info(f"🤖 AI摘要生成成功: {summary[:50]}...")
+            return summary
+            
+        except Exception as e:
+            self.logger.error(f"❌ AI摘要生成失败: {e}")
+            return ""
+    
+    def batch_summarize(self, news_items: List[NewsItem]) -> Dict[str, str]:
+        """批量生成摘要"""
+        summaries = {}
+        for item in news_items:
+            summary = self.summarize(item.title)
+            if summary:
+                summaries[f"{item.date}|{item.title}"] = summary
+            time.sleep(0.5)  # 避免请求过快
+        return summaries
+
+
+class LogAnalyzer:
+    """AI 日志分析器 - 每小时整理日志"""
+    def __init__(self, logger: LoggerManager):
+        self.logger = logger
+        self.api_key = SILICONFLOW_API_KEY
+        self.api_url = SILICONFLOW_API_URL
+        self.model = SILICONFLOW_MODEL
+        self.enabled = AI_SUMMARY_ENABLED
+        self.ssl_context = ssl.create_default_context()
+        self.ssl_context.check_hostname = False
+        self.ssl_context.verify_mode = ssl.CERT_NONE
+        self.last_analyze_time = 0
+    
+    def should_analyze(self) -> bool:
+        """检查是否应该进行日志分析"""
+        current_time = time.time()
+        if current_time - self.last_analyze_time >= LOG_AI_SUMMARY_INTERVAL:
+            self.last_analyze_time = current_time
+            return True
+        return False
+    
+    def analyze_logs(self, log_content: str) -> dict:
+        """使用AI分析日志内容"""
+        if not self.enabled or not log_content:
+            return {}
+        
+        try:
+            # 限制日志内容长度，避免超出token限制
+            max_length = 3000
+            if len(log_content) > max_length:
+                log_content = log_content[-max_length:]
+            
+            prompt = f"""请分析以下监控系统日志，提取关键信息并生成简洁的摘要报告：
+
+日志内容：
+{log_content}
+
+请按以下格式输出（每行一个要点）：
+- 检查次数：X次
+- 新公告：X条
+- 特殊通知：X条
+- 异常情况：简要描述或"无"
+- 系统状态：正常/异常
+
+请直接输出结果，不要添加解释。"""
+            
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "你是一位专业的系统日志分析专家，擅长从日志中提取关键信息。"},
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 500,
+                "temperature": 0.3,
+                "top_p": 0.7
+            }
+            
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            req = urllib.request.Request(
+                self.api_url,
+                data=json.dumps(payload).encode('utf-8'),
+                headers=headers,
+                method='POST'
+            )
+            
+            self.logger.info("🤖 AI正在分析日志...")
+            
+            with urllib.request.urlopen(req, context=self.ssl_context, timeout=30) as response:
+                result = json.loads(response.read().decode('utf-8'))
+            
+            analysis = result['choices'][0]['message']['content'].strip()
+            
+            # 解析分析结果
+            summary = {
+                'raw_analysis': analysis,
+                'check_count': self._extract_number(analysis, '检查次数'),
+                'new_news': self._extract_number(analysis, '新公告'),
+                'special_news': self._extract_number(analysis, '特殊通知'),
+                'status': '异常' if '异常' in analysis else '正常'
+            }
+            
+            self.logger.info(f"🤖 AI日志分析完成: {summary['status']}")
+            return summary
+            
+        except Exception as e:
+            self.logger.error(f"❌ AI日志分析失败: {e}")
+            return {'status': '分析失败', 'raw_analysis': ''}
+    
+    def _extract_number(self, text: str, keyword: str) -> int:
+        """从文本中提取数字"""
+        try:
+            import re
+            pattern = f"{keyword}[:：]\\s*(\\d+)"
+            match = re.search(pattern, text)
+            if match:
+                return int(match.group(1))
+        except:
+            pass
+        return 0
+    
+    def read_recent_logs(self, lines: int = 100) -> str:
+        """读取最近的日志内容"""
+        try:
+            if not LOG_FILE.exists():
+                return ""
+            
+            with open(LOG_FILE, 'r', encoding='utf-8') as f:
+                all_lines = f.readlines()
+                return ''.join(all_lines[-lines:])
+        except Exception as e:
+            self.logger.error(f"❌ 读取日志失败: {e}")
+            return ""
+
+
 class NewsFetcher:
     """新闻抓取器"""
     def __init__(self):
@@ -471,13 +668,19 @@ class EmailSender:
         self.smtp_server = SMTP_SERVER
         self.smtp_port = SMTP_PORT
     
-    def send(self, subject: str, html_content: str) -> bool:
+    def send(self, subject: str, html_content: str, text_content: str = None) -> bool:
         try:
-            msg = MIMEMultipart()
+            msg = MIMEMultipart('alternative')
             from_header = f"{Header(SMTP_NAME, 'utf-8').encode()} <{self.smtp_user}>"
             msg['From'] = from_header
             msg['To'] = ", ".join(self.to_emails)
             msg['Subject'] = Header(subject, 'utf-8').encode()
+            
+            # 添加纯文本内容（邮件客户端优先显示）
+            if text_content:
+                msg.attach(MIMEText(text_content, 'plain', 'utf-8'))
+            
+            # 添加HTML内容
             msg.attach(MIMEText(html_content, 'html', 'utf-8'))
             
             with smtplib.SMTP_SSL(self.smtp_server, self.smtp_port) as server:
@@ -531,7 +734,7 @@ class EmailSender:
         </html>
         """
         
-        subject = f"【宿迁通告监控小助手】· 测试邮件 - 系统运行正常"
+        subject = f"【测试邮件】系统运行正常"
         return self.send(subject, html)
     
     def send_news_notification(self, news_items: List[NewsItem], has_new: bool = True) -> bool:
@@ -540,6 +743,7 @@ class EmailSender:
         
         if not has_new:
             # 无新通知时的简洁邮件
+            text_content = f"{today} 暂无新公告\n\n下次检查: 10分钟后"
             html = f"""
             <!DOCTYPE html>
             <html>
@@ -574,13 +778,30 @@ class EmailSender:
             </body>
             </html>
             """
-            subject = f"【宿迁通告监控小助手】· 无变化"
-            return self.send(subject, html)
+            subject = f"【无新公告】{today}"
+            return self.send(subject, html, text_content)
         
         # 有新通知时的邮件
+        # 生成纯文本摘要（邮件预览显示）
+        text_summary = f"今日 {len(news_items)} 条新公告:\n"
+        for i, item in enumerate(news_items[:3], 1):
+            text_summary += f"{i}. {item.title}\n"
+        if len(news_items) > 3:
+            text_summary += f"... 还有 {len(news_items)-3} 条\n"
+        text_summary += f"\n查看详情: https://jyj.suqian.gov.cn/sjyj/tzgg/list.shtml"
+        
         news_cards = ""
         for i, item in enumerate(news_items, 1):
             full_url = f"https://jyj.suqian.gov.cn{item.url}" if not item.url.startswith('http') else item.url
+            # AI摘要显示
+            ai_summary_html = ""
+            if item.ai_summary:
+                ai_summary_html = f"""
+                <div style="margin-top: 10px; padding: 10px; background: #f0f7ff; border-radius: 8px; border-left: 3px solid #667eea;">
+                    <span style="color: #667eea; font-size: 12px; font-weight: 600;">🤖 AI摘要:</span>
+                    <span style="color: #555; font-size: 13px; margin-left: 5px;">{item.ai_summary}</span>
+                </div>
+                """
             news_cards += f"""
             <div style="background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 15px; border: 1px solid #e8e8e8;">
                 <div style="display: flex; align-items: center; margin-bottom: 12px;">
@@ -590,6 +811,7 @@ class EmailSender:
                 <a href="{full_url}" style="color: #1a73e8; text-decoration: none; font-size: 16px; font-weight: 500; line-height: 1.6; display: block;">
                     {item.title}
                 </a>
+                {ai_summary_html}
             </div>
             """
         
@@ -627,8 +849,8 @@ class EmailSender:
         </html>
         """
         
-        subject = f"【宿迁通告监控小助手】· 重点提醒 - 今日{len(news_items)}条新公告"
-        return self.send(subject, html)
+        subject = f"【新公告】今日{len(news_items)}条"
+        return self.send(subject, html, text_summary)
     
     def send_special_notification(self, item: NewsItem) -> bool:
         """发送特殊通知（含附件）"""
@@ -707,8 +929,17 @@ class EmailSender:
         </html>
         """
         
-        subject = f"【宿迁通告监控小助手】· 重点关注 - {item.title[:25]}..."
-        return self.send(subject, html)
+        # 生成纯文本摘要
+        text_summary = f"[重点关注] {item.title}\n\n"
+        text_summary += f"发布日期: {item.date}\n"
+        text_summary += f"查看详情: {full_url}\n\n"
+        if item.attachments:
+            text_summary += f"附件数量: {len(item.attachments)}个\n"
+            for i, attach in enumerate(item.attachments[:3], 1):
+                text_summary += f"{i}. {attach['name']}\n"
+        
+        subject = f"【[重点关注] {item.title[:30]}"
+        return self.send(subject, html, text_summary)
     
     def send_report(self, stats: dict) -> bool:
         """发送述职报告"""
@@ -805,8 +1036,20 @@ class EmailSender:
         </html>
         """
         
-        subject = f"【宿迁通告监控小助手】· 运行日报 - {today}"
-        return self.send(subject, html)
+        # 生成纯文本摘要 - 简洁重点
+        today_total = stats['today']['total_today']
+        notified = stats['today']['notified']
+        text_summary = f"{today} 运行日报\n\n"
+        text_summary += f"📊 今日公告: {today_total}条"
+        if today_total > 0:
+            text_summary += f" (已推送{notified}条)\n"
+        else:
+            text_summary += "\n"
+        text_summary += f"⏱️ 运行时长: {runtime_str}\n"
+        text_summary += f"✅ 系统运行正常"
+        
+        subject = f"【运行日报】{today} 公告{today_total}条"
+        return self.send(subject, html, text_summary)
 
 
 class EmailWorker(threading.Thread):
@@ -887,6 +1130,8 @@ class MonitorThread(threading.Thread):
         self.download_queue = download_queue
         self.logger = logger
         self.fetcher = NewsFetcher()
+        self.ai_summarizer = AISummarizer(logger)
+        self.log_analyzer = LogAnalyzer(logger)
         self.running = True
         self.last_check_time = 0
         self.last_report_time = 0
@@ -924,6 +1169,10 @@ class MonitorThread(threading.Thread):
             if current_time - self.last_report_time >= REPORT_INTERVAL:
                 self._do_report()
             
+            # AI日志分析（每小时一次）
+            if self.log_analyzer.should_analyze():
+                self._do_log_analysis()
+            
             time.sleep(1)
     
     def _do_check(self):
@@ -941,6 +1190,19 @@ class MonitorThread(threading.Thread):
         
         if new_items:
             self.logger.info(f"🆕 发现 {len(new_items)} 条新公告")
+            
+            # AI生成摘要
+            if AI_SUMMARY_ENABLED:
+                self.logger.info("🤖 正在生成AI摘要...")
+                for item in new_items:
+                    if not item.ai_summary:  # 只对新公告生成摘要
+                        summary = self.ai_summarizer.summarize(item.title)
+                        if summary:
+                            item.ai_summary = summary
+                            # 更新数据存储中的摘要
+                            self.data_store.save()
+                        time.sleep(0.5)  # 避免请求过快
+            
             # 提交邮件任务
             task = EmailTask(
                 email_type=EmailType.NEWS,
@@ -955,9 +1217,6 @@ class MonitorThread(threading.Thread):
                     self.download_queue.put(download_task)
         else:
             self.logger.info("📭 暂无新公告")
-            # 可选：发送无变化通知（每小时一次）
-            # task = EmailTask(email_type=EmailType.NEWS, news_items=[])
-            # self.email_queue.put(task)
         
         self.data_store.save()
     
@@ -967,6 +1226,39 @@ class MonitorThread(threading.Thread):
         
         task = EmailTask(email_type=EmailType.REPORT)
         self.email_queue.put(task)
+    
+    def _do_log_analysis(self):
+        """执行AI日志分析"""
+        try:
+            self.logger.info("🤖 开始AI日志分析...")
+            
+            # 读取最近日志
+            log_content = self.log_analyzer.read_recent_logs(lines=200)
+            if not log_content:
+                self.logger.warning("⚠️ 日志内容为空，跳过分析")
+                return
+            
+            # AI分析
+            analysis = self.log_analyzer.analyze_logs(log_content)
+            
+            if analysis and analysis.get('status') != '分析失败':
+                # 记录分析结果到日志
+                self.logger.info("=" * 50)
+                self.logger.info("🤖 AI日志分析结果")
+                self.logger.info(f"   检查次数: {analysis.get('check_count', 0)}")
+                self.logger.info(f"   新公告: {analysis.get('new_news', 0)}条")
+                self.logger.info(f"   特殊通知: {analysis.get('special_news', 0)}条")
+                self.logger.info(f"   系统状态: {analysis.get('status', '未知')}")
+                self.logger.info("=" * 50)
+                
+                # 如果系统状态异常，发送警告邮件
+                if analysis.get('status') == '异常':
+                    self.logger.warning("⚠️ 系统状态异常，建议检查")
+            else:
+                self.logger.warning("⚠️ AI日志分析未返回有效结果")
+                
+        except Exception as e:
+            self.logger.error(f"❌ AI日志分析执行失败: {e}")
     
     def stop(self):
         self.running = False
